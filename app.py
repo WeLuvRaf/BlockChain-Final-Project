@@ -1,143 +1,183 @@
+"""Streamlit interface for the carbon credit registry classroom demo."""
+
+from datetime import datetime, timezone
+
 import streamlit as st
 
-class PreviewLedger:
-    """Session-local sample records for trying the interface."""
-
-    def __init__(self):
-        self.history = {}
-
-    def issue_credit(self, *, credit_id, project, owner, actor):
-        if actor != "registry":
-            raise PermissionError("Only the registry can issue credits in the preview.")
-        if credit_id in self.history:
-            raise ValueError("That credit ID is already registered.")
-        self.history[credit_id] = [
-            dict(action="Issued", owner=owner, project=project, status="Active", actor=actor)
-        ]
-
-    def get_credit_history(self, credit_id):
-        return self.history.get(credit_id, [])
-
-    def _record_change(self, credit_id, actor, action, status, new_owner=None):
-        entries = self.get_credit_history(credit_id)
-        if not entries:
-            raise ValueError("Credit ID not found.")
-        latest = entries[-1]
-        if latest["status"] == "Retired":
-            raise ValueError("This credit has already been retired.")
-        if latest["owner"] != actor:
-            raise PermissionError("Only the current owner can perform this action.")
-        if new_owner == actor:
-            raise ValueError("Choose a different owner.")
-        entries.append(
-            dict(latest, action=action, owner=new_owner or actor, status=status, actor=actor)
-        )
-
-    def transfer_credit(self, *, credit_id, new_owner, actor):
-        self._record_change(credit_id, actor, "Transferred", "Active", new_owner)
-
-    def retire_credit(self, *, credit_id, actor):
-        self._record_change(credit_id, actor, "Retired", "Retired")
+from blockchain import (
+    ISSUE,
+    MAX_BUFFER_PERCENT,
+    MAX_ISSUANCE,
+    MIN_VINTAGE,
+    RETIRE,
+    TRANSFER,
+    CarbonLedger,
+    LedgerError,
+)
+from security import KeyPair, hash_document
 
 
-def get_backend():
-    try:
-        from blockchain import Ledger
-    except ModuleNotFoundError as error:
-        if error.name != "blockchain":
-            raise
-        if "preview_ledger" not in st.session_state:
-            st.session_state.preview_ledger = PreviewLedger()
-        return st.session_state.preview_ledger, True
-    if "registry_ledger" not in st.session_state:
-        st.session_state.registry_ledger = Ledger()
-    return st.session_state.registry_ledger, False
+def create_demo():
+    governance = KeyPair()
+    validator = KeyPair()
+    accounts = {name: KeyPair() for name in ("Registry A", "Developer", "Buyer")}
+    ledger = CarbonLedger.create(
+        governance_keys=[governance.public_key_hex],
+        threshold=1,
+        validator_keys=[validator.public_key_hex],
+        issuers=[
+            {
+                "public_key": accounts["Registry A"].public_key_hex,
+                "name": "Registry A",
+                "standard": "RA",
+            }
+        ],
+    )
+    return ledger, validator, accounts
 
 
 def show_history(ledger):
     with st.form("lookup"):
-        credit_id = st.text_input("Credit ID", placeholder="CC-001")
+        serial = st.text_input(
+            "Credit serial", value=st.session_state.get("lookup_id", "")
+        )
         submitted = st.form_submit_button("Look up credit", type="primary")
+
     if submitted:
-        st.session_state.lookup_id = credit_id.strip()
-    credit_id = st.session_state.get("lookup_id")
-    if credit_id is None:
+        st.session_state.lookup_id = serial.strip()
+
+    serial = st.session_state.get("lookup_id")
+    if not serial:
+        if submitted:
+            st.error("Enter a credit serial.")
         return
-    if not credit_id:
-        st.error("Enter a credit ID.")
+
+    credit = ledger.get_credit(serial)
+    if credit is None:
+        st.info(f"No record found for {serial}.")
         return
-    history = ledger.get_credit_history(credit_id)
-    if not history:
-        st.info(f"No record found for {credit_id}.")
-        return
-    latest = history[-1]
-    project, owner, status = st.columns(3)
-    project.metric("Project", latest["project"])
-    owner.metric("Current owner", latest["owner"])
-    status.metric("Status", latest["status"])
+
+    project = ledger.get_project(credit["project_id"])
+    st.subheader(serial)
+    st.write(f"{project['name']} · {credit['vintage']}")
+    st.write(f"Status · {credit['status'].title()}")
+    st.text(f"Owner · {credit['owner']}")
+    st.text(f"MRV evidence SHA-256 · {credit['evidence_hash']}")
     st.subheader("Transaction history")
-    st.dataframe(history, hide_index=True)
+    st.dataframe(ledger.credit_history(serial), hide_index=True)
 
 
-def show_write_form(ledger, action):
+def issue_fields(accounts):
+    st.caption("Issuing registry · Registry A")
+    project_id = st.text_input("Project ID", placeholder="AMZ001").strip()
+    project_name = st.text_input("Project name").strip()
+    country = st.text_input("Country").strip()
+    methodology = st.text_input("Methodology").strip()
+    year = datetime.now(timezone.utc).year
+    vintage = st.number_input("Vintage", MIN_VINTAGE, year, year)
+    quantity = st.number_input("Quantity", 1, MAX_ISSUANCE, 1)
+    buffer_percent = st.number_input("Buffer percentage", 0, MAX_BUFFER_PERCENT, 0)
+    owner = st.selectbox("Initial owner", ["Developer", "Buyer"])
+    report = st.file_uploader("MRV report (only its SHA-256 hash is recorded)")
+
+    payload = {
+        "project_id": project_id,
+        "project_name": project_name,
+        "country": country,
+        "methodology": methodology,
+        "vintage": vintage,
+        "quantity": quantity,
+        "buffer_percent": buffer_percent,
+        "owner": accounts[owner].address,
+    }
+    if report is not None:
+        payload["evidence_hash"] = hash_document(report.getvalue())
+    return payload
+
+
+def show_write_form(ledger, validator, accounts, action):
     with st.form(action):
-        credit_id = st.text_input("Credit ID", placeholder="CC-001")
-        actor_label = "Issuing registry ID" if action == "Issue" else "Current owner ID"
-        actor = st.text_input(actor_label)
-        fields = dict(credit_id=credit_id.strip(), actor=actor.strip())
-        if action == "Issue":
-            fields["project"] = st.text_input("Project name").strip()
-            fields["owner"] = st.text_input("Initial owner ID").strip()
-        elif action == "Transfer":
-            fields["new_owner"] = st.text_input("New owner ID").strip()
+        if action == ISSUE:
+            signer = "Registry A"
+            payload = issue_fields(accounts)
         else:
-            confirmed = st.checkbox("I confirm that this credit should be permanently retired.")
-        submitted = st.form_submit_button(f"{action} credit", type="primary")
+            serial = st.text_input(
+                "Credit serial", value=st.session_state.get("lookup_id", "")
+            ).strip()
+            signer = st.selectbox("Signing account", ["Developer", "Buyer", "Registry A"])
+            payload = {"serials": [serial]}
+
+            if action == TRANSFER:
+                recipient = st.selectbox("New owner", ["Buyer", "Developer", "Registry A"])
+                payload["to"] = accounts[recipient].address
+            else:
+                payload["beneficiary"] = st.text_input("Beneficiary").strip()
+                payload["purpose"] = st.text_input("Purpose (optional)").strip()
+                confirmed = st.checkbox("Confirm permanent retirement")
+
+        submitted = st.form_submit_button(f"{action.title()} credit", type="primary")
+
     if not submitted:
         return
-    if not all(fields.values()):
-        st.error("Complete all fields.")
+    if action == ISSUE and "evidence_hash" not in payload:
+        st.error("Upload an MRV report.")
         return
-    if action == "Retire" and not confirmed:
+    if action != ISSUE and not serial:
+        st.error("Enter a credit serial.")
+        return
+    if action == RETIRE and not confirmed:
         st.error("Confirm the retirement before submitting.")
         return
-    operations = {
-        "Issue": (ledger.issue_credit, "issued"),
-        "Transfer": (ledger.transfer_credit, "transferred"),
-        "Retire": (ledger.retire_credit, "retired"),
-    }
-    operation, result = operations[action]
+
     try:
-        operation(**fields)
-    except (ValueError, PermissionError) as error:
+        transaction = ledger.build_transaction(accounts[signer], action, payload)
+        tx_id = ledger.submit(transaction)
+        block = ledger.seal_block(validator)
+    except LedgerError as error:
         st.error(str(error))
+        return
+
+    if action == ISSUE:
+        issuance = ledger.get_project(payload["project_id"])["issuances"][-1]
+        serial = issuance["first_serial"]
+        last_serial = issuance["last_serial"]
+        issued = serial if serial == last_serial else f"{serial} through {last_serial}"
+        st.success(f"Issued {issued} in block {block.index}.")
     else:
-        st.session_state.lookup_id = fields["credit_id"]
-        st.success(f"Credit {fields['credit_id']} {result}. Open Look up to see its history.")
+        verb = "Transferred" if action == TRANSFER else "Retired"
+        st.success(f"{verb} {serial} in block {block.index}.")
+
+    st.session_state.lookup_id = serial
+    st.caption(f"Transaction ID · {tx_id}")
 
 
 def main():
     st.set_page_config(page_title="Carbon Credit Registry", layout="centered")
     st.title("Carbon Credit Registry")
-    ledger, preview = get_backend()
-    if preview:
-        st.info("Interface preview. Use registry as the issuing registry ID. Records last for this session.")
+    st.caption("Classroom demo. Signing accounts and records belong to this browser session.")
+
+    if "registry_demo" not in st.session_state:
+        st.session_state.registry_demo = create_demo()
+    ledger, validator, accounts = st.session_state.registry_demo
+
     view = st.radio(
-        "Registry actions", ["Look up", "Issue", "Transfer", "Retire", "Verify ledger"],
-        horizontal=True, label_visibility="collapsed",
+        "Registry actions",
+        ["Look up", "Issue", "Transfer", "Retire", "Verify ledger"],
+        horizontal=True,
+        label_visibility="collapsed",
     )
+
     if view == "Look up":
         show_history(ledger)
     elif view == "Verify ledger":
-        if preview:
-            st.info("Ledger verification becomes available after the blockchain is connected.")
-        elif st.button("Verify blockchain", type="primary"):
-            if ledger.verify_chain():
-                st.success("The blockchain passed verification.")
+        if st.button("Verify blockchain", type="primary"):
+            valid, detail = ledger.validate_chain()
+            if valid:
+                st.success(detail)
             else:
-                st.error("The blockchain failed verification.")
+                st.error(detail)
     else:
-        show_write_form(ledger, view)
+        show_write_form(ledger, validator, accounts, view.upper())
 
 
 if __name__ == "__main__":
