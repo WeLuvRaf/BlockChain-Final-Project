@@ -46,13 +46,46 @@ BytesLike = Union[bytes, str]
 # --------------------------------------------------------------------------
 
 def _to_bytes(data: BytesLike) -> bytes:
-    return data.encode("utf-8") if isinstance(data, str) else data
+    if isinstance(data, str):
+        return data.encode("utf-8")
+    if isinstance(data, bytes):
+        return data
+    raise TypeError("data must be bytes or text")
+
+
+def _validate_json_value(value: Any, ancestors: Optional[set] = None) -> None:
+    """Reject Python-only values that JSON would silently coerce."""
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return
+    if not isinstance(value, (list, dict)):
+        raise TypeError(f"{type(value).__name__} is not a JSON value")
+
+    ancestors = set() if ancestors is None else ancestors
+    marker = id(value)
+    if marker in ancestors:
+        raise ValueError("circular JSON value")
+    ancestors.add(marker)
+    try:
+        if isinstance(value, list):
+            for item in value:
+                _validate_json_value(item, ancestors)
+        else:
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise TypeError("JSON object keys must be text")
+                _validate_json_value(item, ancestors)
+    finally:
+        ancestors.remove(marker)
 
 
 def canonical_json(obj: Any) -> bytes:
     """Deterministic JSON encoding: sorted keys, no whitespace, UTF-8."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False).encode("utf-8")
+    try:
+        _validate_json_value(obj)
+        return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except RecursionError as exc:
+        raise ValueError("JSON value is nested too deeply") from exc
 
 
 def sha256_hex(data: BytesLike) -> str:
@@ -67,13 +100,8 @@ def hash_object(obj: Any) -> str:
 
 def is_hex_hash(value: Any) -> bool:
     """True if value looks like a SHA-256 hex digest."""
-    if not isinstance(value, str) or len(value) != 64:
-        return False
-    try:
-        bytes.fromhex(value)
-    except ValueError:
-        return False
-    return value == value.lower()
+    return (isinstance(value, str) and len(value) == 64
+            and all(c in "0123456789abcdef" for c in value))
 
 
 def hash_document(content: BytesLike) -> str:
@@ -95,6 +123,8 @@ def verify_document(content: BytesLike, expected_hash: str) -> bool:
 # --------------------------------------------------------------------------
 
 def _leaf(h: str) -> bytes:
+    if not is_hex_hash(h):
+        raise ValueError("Merkle leaves must be lowercase SHA-256 hashes")
     return hashlib.sha256(_MERKLE_LEAF_PREFIX + bytes.fromhex(h)).digest()
 
 
@@ -146,8 +176,12 @@ def merkle_proof(leaf_hashes: List[str], index: int) -> List[Tuple[str, str]]:
 def verify_merkle_proof(leaf_hash: str, proof: List[Tuple[str, str]], root: str) -> bool:
     """Recompute the root from one leaf and its proof and compare."""
     try:
+        if not is_hex_hash(root):
+            return False
         acc = _leaf(leaf_hash)
         for sibling_hex, side in proof:
+            if not is_hex_hash(sibling_hex):
+                return False
             sibling = bytes.fromhex(sibling_hex)
             if side == "L":
                 acc = _node(sibling, acc)
@@ -170,7 +204,8 @@ def _load_public_key(public_key_hex: str) -> ec.EllipticCurvePublicKey:
 
 def is_valid_public_key(public_key_hex: Any) -> bool:
     """True if the value is a compressed secp256k1 public key on the curve."""
-    if not isinstance(public_key_hex, str) or len(public_key_hex) != 66:
+    if not isinstance(public_key_hex, str) or len(public_key_hex) != 66 \
+            or public_key_hex != public_key_hex.lower():
         return False
     try:
         _load_public_key(public_key_hex)
@@ -181,6 +216,8 @@ def is_valid_public_key(public_key_hex: Any) -> bool:
 
 def address_from_public_key(public_key_hex: str) -> str:
     """Account address: 'cc' + the first 160 bits of SHA-256(public key)."""
+    if not is_valid_public_key(public_key_hex):
+        raise ValueError("public key must be a compressed secp256k1 key")
     digest = hashlib.sha256(bytes.fromhex(public_key_hex)).hexdigest()
     return ADDRESS_PREFIX + digest[:ADDRESS_HEX_LENGTH]
 

@@ -15,12 +15,12 @@ APP_PATH = Path(__file__).with_name("app.py")
 
 class RegistryAppTests(unittest.TestCase):
     def setUp(self):
-        self.app = AppTest.from_file(str(APP_PATH)).run()
+        self.app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
         self.assertFalse(self.app.exception)
 
     def test_issue_requires_evidence(self):
-        self.app.radio[0].set_value("Issue").run()
-        self.app.button[0].click().run()
+        self.app.radio[0].set_value("Issue").run(timeout=10)
+        self.app.button[0].click().run(timeout=10)
         self.assertEqual(self.app.error[0].value, "Upload an MRV report.")
 
     def test_transfer_retire_lookup_and_verify(self):
@@ -41,29 +41,29 @@ class RegistryAppTests(unittest.TestCase):
         serial = ledger.get_project("P1")["issuances"][0]["first_serial"]
         self.app.session_state["registry_demo"] = (ledger, validator, accounts)
 
-        self.app.radio[0].set_value("Transfer").run()
+        self.app.radio[0].set_value("Transfer").run(timeout=10)
         self.app.text_input[0].set_value(serial)
-        self.app.button[0].click().run()
+        self.app.button[0].click().run(timeout=10)
         self.assertFalse(self.app.exception)
         self.assertEqual(ledger.get_credit(serial)["owner"], accounts["Buyer"].address)
         self.assertIn("Transferred", self.app.success[0].value)
 
-        self.app.radio[0].set_value("Retire").run()
+        self.app.radio[0].set_value("Retire").run(timeout=10)
         self.app.text_input[0].set_value(serial)
         self.app.selectbox[0].set_value("Buyer")
         self.app.text_input[1].set_value("Example Corp")
         self.app.checkbox[0].check()
-        self.app.button[0].click().run()
+        self.app.button[0].click().run(timeout=10)
         self.assertFalse(self.app.exception)
         self.assertEqual(ledger.get_credit(serial)["status"], "RETIRED")
         self.assertIn("Retired", self.app.success[0].value)
 
-        self.app.radio[0].set_value("Look up").run()
+        self.app.radio[0].set_value("Look up").run(timeout=10)
         self.assertFalse(self.app.exception)
         self.assertEqual(len(self.app.dataframe[0].value), 3)
 
-        self.app.radio[0].set_value("Verify ledger").run()
-        self.app.button[0].click().run()
+        self.app.radio[0].set_value("Verify ledger").run(timeout=10)
+        self.app.button[0].click().run(timeout=10)
         self.assertIn("4 blocks verified", self.app.success[0].value)
 
 

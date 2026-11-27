@@ -13,8 +13,8 @@ from blockchain import (ACTIVE, ADD_ISSUER, BUFFER_POOL, CANCELLED, ISSUE, RETIR
                         REVERSE, REVOKE_ISSUER, TRANSFER, Block, CarbonLedger, LedgerError,
                         Transaction)
 from security import (KeyPair, address_from_public_key, hash_document, hash_object,
-                      is_valid_address, merkle_proof, merkle_root, sha256_hex,
-                      verify_document, verify_merkle_proof, verify_signature)
+                      is_hex_hash, is_valid_address, is_valid_public_key, merkle_proof, merkle_root,
+                      sha256_hex, verify_document, verify_merkle_proof, verify_signature)
 
 
 # --------------------------------------------------------------------------
@@ -31,6 +31,19 @@ class TestHashing(unittest.TestCase):
 
     def test_hash_changes_with_one_character(self):
         self.assertNotEqual(hash_object({"to": "alice"}), hash_object({"to": "alicf"}))
+
+    def test_non_finite_json_numbers_are_rejected(self):
+        with self.assertRaises(ValueError):
+            hash_object({"quantity": float("nan")})
+
+    def test_hash_format_rejects_whitespace(self):
+        self.assertFalse(is_hex_hash("00" * 31 + "  "))
+
+    def test_python_only_json_values_are_rejected(self):
+        with self.assertRaises(TypeError):
+            hash_object({1: "value"})
+        with self.assertRaises(TypeError):
+            hash_object({"items": (1, 2)})
 
     def test_document_hash_verification(self):
         report = b"MRV report: 100 tCO2e"
@@ -60,6 +73,10 @@ class TestSignatures(unittest.TestCase):
         self.assertTrue(is_valid_address(self.alice.address))
         self.assertEqual(self.alice.address, address_from_public_key(self.alice.public_key_hex))
         self.assertFalse(is_valid_address(BUFFER_POOL))
+
+    def test_public_keys_have_one_canonical_encoding(self):
+        self.assertTrue(is_valid_public_key(self.alice.public_key_hex))
+        self.assertFalse(is_valid_public_key(self.alice.public_key_hex.upper()))
 
     def test_encrypted_key_round_trip(self):
         pem = self.alice.to_pem(password="correct horse")
@@ -148,6 +165,11 @@ class TestIssuance(LedgerTestCase):
         self.issue(quantity=5, buffer_percent=0)
         self.assertIsNotNone(self.ledger.get_credit("RA-AMZ001-2024-000010"))
         self.assertEqual(len(self.ledger.state.credits), 10)
+
+    def test_repeat_issuance_cannot_change_project_metadata(self):
+        self.issue(quantity=1, buffer_percent=0)
+        with self.assertRaisesRegex(LedgerError, "metadata does not match"):
+            self.issue(project_name="A different project", quantity=1, buffer_percent=0)
 
     def test_only_accredited_registry_can_issue(self):
         with self.assertRaisesRegex(LedgerError, "permission denied"):
@@ -270,6 +292,14 @@ class TestSignaturesAndReplay(LedgerTestCase):
             self.send(self.developer, TRANSFER, {"serials": ["NOPE"], "to": self.buyer.address})
         self.assertEqual(self.ledger.next_nonce(self.developer.address), before)
 
+    def test_submitted_transaction_is_snapshotted(self):
+        tx = self.ledger.build_transaction(
+            self.developer, TRANSFER, {"serials": self.serials, "to": self.buyer.address})
+        self.ledger.submit(tx)
+        tx.payload["to"] = self.outsider.address
+        self.ledger.seal_block(self.validator)
+        self.assertEqual(self.ledger.get_credit(self.serials[0])["owner"], self.buyer.address)
+
 
 class TestGovernance(LedgerTestCase):
     def setUp(self):
@@ -358,6 +388,12 @@ class TestChainIntegrity(LedgerTestCase):
         self.ledger.chain[0].transactions[0].payload["threshold"] = 1
         self.assertFalse(self.ledger.is_valid())
 
+    def test_non_finite_in_memory_tampering_is_reported(self):
+        self.ledger.chain[1].transactions[0].payload["quantity"] = float("nan")
+        ok, _ = self.ledger.validate_chain()
+        self.assertFalse(ok)
+        self.assertFalse(self.ledger.audit()[1]["ok"])
+
     def test_unauthorised_validator_cannot_seal(self):
         self.ledger.submit(self.ledger.build_transaction(
             self.buyer, RETIRE, {"serials": self.ledger.select_serials(self.buyer.address, 1),
@@ -373,6 +409,16 @@ class TestChainIntegrity(LedgerTestCase):
         block = Block(self.ledger.height, time.time(), self.ledger.last_block.hash, [rogue_tx])
         data["chain"].append(block.seal(self.outsider).to_dict())
         with self.assertRaisesRegex(LedgerError, "unauthorised validator"):
+            CarbonLedger.from_dict(data)
+
+    def test_future_block_rejected_on_load(self):
+        data = self.ledger.to_dict()
+        tx = self.ledger.build_transaction(
+            self.buyer, RETIRE, {"serials": self.ledger.select_serials(self.buyer.address, 1),
+                                 "beneficiary": "x"})
+        block = Block(self.ledger.height, time.time() + 600, self.ledger.last_block.hash, [tx])
+        data["chain"].append(block.seal(self.validator).to_dict())
+        with self.assertRaisesRegex(LedgerError, "future"):
             CarbonLedger.from_dict(data)
 
     def test_merkle_inclusion_proof(self):
@@ -404,6 +450,21 @@ class TestChainIntegrity(LedgerTestCase):
         data["chain"][2]["timestamp"] = float("nan")
         with self.assertRaises(LedgerError):
             CarbonLedger.from_dict(data)
+
+        data = self.ledger.to_dict()
+        data["chain"][1]["tx_count"] += 1
+        with self.assertRaises(LedgerError):
+            CarbonLedger.from_dict(data)
+
+        data = self.ledger.to_dict()
+        data["pending"] = "not a list"
+        with self.assertRaises(LedgerError):
+            CarbonLedger.from_dict(data)
+
+    def test_malformed_inclusion_proof_returns_false(self):
+        self.assertFalse(CarbonLedger.verify_inclusion({}))
+        self.assertFalse(CarbonLedger.verify_inclusion({"leaf_hash": "x", "proof": ["bad"],
+                                                        "merkle_root": "y"}))
 
     def test_longer_valid_chain_replaces_shorter(self):
         other = CarbonLedger.from_dict({"chain": self.ledger.to_dict()["chain"][:2]})

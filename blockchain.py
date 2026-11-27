@@ -199,6 +199,15 @@ class Transaction:
             approvals = data.get("approvals", [])
             if not isinstance(approvals, list):
                 raise TypeError("approvals must be a list")
+            parsed_approvals = []
+            for approval in approvals:
+                if not isinstance(approval, dict):
+                    raise TypeError("each approval must be an object")
+                public_key = approval["public_key"]
+                signature = approval["signature"]
+                if not isinstance(public_key, str) or not isinstance(signature, str):
+                    raise TypeError("approval fields must be text")
+                parsed_approvals.append({"public_key": public_key, "signature": signature})
             tx = cls(
                 tx_type=data["tx_type"],
                 sender=data["sender"],
@@ -206,8 +215,7 @@ class Transaction:
                 nonce=data["nonce"],
                 timestamp=data["timestamp"],
                 signature=data.get("signature", ""),
-                approvals=[{"public_key": str(a["public_key"]), "signature": str(a["signature"])}
-                           for a in approvals],
+                approvals=parsed_approvals,
             )
         except (KeyError, TypeError) as exc:
             raise LedgerError(f"malformed transaction: {exc}") from exc
@@ -215,6 +223,10 @@ class Transaction:
                 or not isinstance(tx.payload, dict) or not isinstance(tx.signature, str) \
                 or type(tx.nonce) is not int or not _valid_timestamp(tx.timestamp):
             raise LedgerError("malformed transaction: wrong field types")
+        try:
+            tx.signing_bytes()
+        except (TypeError, ValueError) as exc:
+            raise LedgerError(f"malformed transaction payload: {exc}") from exc
         return tx
 
 
@@ -294,6 +306,18 @@ class Block:
                 or not all(isinstance(v, str) for v in (block.previous_hash, block.validator,
                                                         block.merkle_root, block.signature)):
             raise LedgerError("malformed block: wrong field types")
+        if block.index < 0 or not is_hex_hash(block.previous_hash) \
+                or not is_hex_hash(block.merkle_root):
+            raise LedgerError("malformed block: invalid index or hash")
+        if "tx_count" in data and (type(data["tx_count"]) is not int
+                                   or data["tx_count"] != len(block.transactions)):
+            raise LedgerError("malformed block: transaction count does not match")
+        try:
+            computed_hash = block.hash
+        except (TypeError, ValueError) as exc:
+            raise LedgerError(f"malformed block: {exc}") from exc
+        if "hash" in data and data["hash"] != computed_hash:
+            raise LedgerError("malformed block: stored hash does not match its header")
         return block
 
 
@@ -365,6 +389,14 @@ class LedgerState:
     def apply_genesis(self, tx: Transaction) -> None:
         if tx.tx_type != GENESIS:
             raise LedgerError("first transaction must be GENESIS")
+        if not isinstance(tx.payload, dict) or tx.sender or tx.signature or tx.approvals \
+                or type(tx.nonce) is not int or tx.nonce != 0 \
+                or not _valid_timestamp(tx.timestamp):
+            raise LedgerError("GENESIS transaction must be unsigned with nonce 0")
+        try:
+            tx.signing_bytes()
+        except (TypeError, ValueError) as exc:
+            raise LedgerError(f"GENESIS payload is not valid JSON data: {exc}") from exc
         cfg = tx.payload
         governance = cfg.get("governance")
         validators = cfg.get("validators")
@@ -400,6 +432,15 @@ class LedgerState:
         apply it.  Each handler checks everything before it changes anything,
         so a rejected transaction leaves the state untouched.
         """
+        approvals_valid = (isinstance(tx.approvals, list)
+                           and all(isinstance(a, dict)
+                                   and isinstance(a.get("public_key"), str)
+                                   and isinstance(a.get("signature"), str)
+                                   for a in tx.approvals))
+        if not isinstance(tx.tx_type, str) or not isinstance(tx.sender, str) \
+                or not isinstance(tx.payload, dict) or not isinstance(tx.signature, str) \
+                or type(tx.nonce) is not int or tx.nonce < 0 or not approvals_valid:
+            raise LedgerError("malformed transaction: wrong field types")
         if tx.tx_type not in TX_TYPES:
             raise LedgerError(f"unknown transaction type '{tx.tx_type}'")
         if not _valid_timestamp(tx.timestamp):
@@ -519,6 +560,11 @@ class LedgerState:
             other = self.issuers[project["issuer"]]["name"]
             raise LedgerError(f"double issuance rejected: project {project_id} is already "
                               f"registered with {other}")
+        if project is not None:
+            supplied = (project_name, country, methodology)
+            recorded = (project["name"], project["country"], project["methodology"])
+            if supplied != recorded:
+                raise LedgerError(f"project {project_id} metadata does not match its registration")
 
         # All checks passed -- now change state.
         if project is None:
@@ -530,7 +576,7 @@ class LedgerState:
 
         buffer_qty = quantity * buffer_percent // 100
         start = project["issued_per_vintage"].get(str(vintage), 0) + 1
-        serials = [f"{issuer['standard']}-{project_id}-{vintage}-{n:06d}"
+        serials = [f"{project['standard']}-{project_id}-{vintage}-{n:06d}"
                    for n in range(start, start + quantity)]
         for i, serial in enumerate(serials):
             in_buffer = i >= quantity - buffer_qty
@@ -538,7 +584,7 @@ class LedgerState:
                 "serial": serial,
                 "project_id": project_id,
                 "vintage": vintage,
-                "standard": issuer["standard"],
+                "standard": project["standard"],
                 "issuer": issuer["address"],
                 "owner": BUFFER_POOL if in_buffer else owner,
                 "status": ACTIVE,
@@ -632,7 +678,9 @@ class CarbonLedger:
         chain = [Block.from_dict(b) for b in data["chain"]]
         ledger = cls(chain, cls._replay(chain))
         pending = data.get("pending", [])
-        for tx_data in pending if isinstance(pending, list) else []:
+        if not isinstance(pending, list):
+            raise LedgerError("ledger file 'pending' value must be a list")
+        for tx_data in pending:
             try:
                 ledger.submit(Transaction.from_dict(tx_data))
             except LedgerError:
@@ -641,34 +689,43 @@ class CarbonLedger:
 
     def save(self, path: str) -> None:
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump(self.to_dict(), fh, indent=2)
+            json.dump(self.to_dict(), fh, indent=2, allow_nan=False)
 
     @classmethod
     def load(cls, path: str) -> "CarbonLedger":
         with open(path, "r", encoding="utf-8") as fh:
-            return cls.from_dict(json.load(fh))
+            try:
+                data = json.load(fh)
+            except json.JSONDecodeError as exc:
+                raise LedgerError(f"ledger file is not valid JSON: {exc.msg}") from exc
+        return cls.from_dict(data)
 
     # -- read-only views -------------------------------------------------------
 
     @property
     def chain(self) -> List[Block]:
-        return self._chain
+        with self._lock:
+            return list(self._chain)
 
     @property
     def pending(self) -> List[Transaction]:
-        return list(self._pending)
+        with self._lock:
+            return [Transaction.from_dict(tx.to_dict()) for tx in self._pending]
 
     @property
     def state(self) -> LedgerState:
-        return self._state
+        with self._lock:
+            return self._state.copy()
 
     @property
     def last_block(self) -> Block:
-        return self._chain[-1]
+        with self._lock:
+            return self._chain[-1]
 
     @property
     def height(self) -> int:
-        return len(self._chain)
+        with self._lock:
+            return len(self._chain)
 
     # -- writing -----------------------------------------------------------------
 
@@ -695,16 +752,21 @@ class CarbonLedger:
         fails, so a double spend is rejected before it ever reaches a block.
         """
         with self._lock:
+            if not isinstance(tx, Transaction):
+                raise LedgerError("submit expects a Transaction")
             if tx.tx_type == GENESIS:
                 raise LedgerError("GENESIS transactions are only allowed in block 0")
             if not _valid_timestamp(tx.timestamp) or tx.timestamp > time.time() + MAX_CLOCK_SKEW:
                 raise LedgerError("transaction timestamp is in the future or invalid")
             try:
-                self._pending_state.apply(tx)  # atomic: raises without changing state
+                # Snapshot the transaction so later caller mutations cannot alter
+                # the already-validated mempool entry.
+                stored_tx = Transaction.from_dict(tx.to_dict())
+                self._pending_state.apply(stored_tx)  # atomic: raises without changing state
             except (TypeError, ValueError) as exc:
                 raise LedgerError(f"payload is not valid JSON data: {exc}") from exc
-            self._pending.append(tx)
-            return tx.tx_id
+            self._pending.append(stored_tx)
+            return stored_tx.tx_id
 
     def seal_block(self, validator: KeyPair, max_txs: int = MAX_TXS_PER_BLOCK) -> Block:
         """Proof of Authority: an approved validator signs the next block of pending transactions."""
@@ -713,12 +775,14 @@ class CarbonLedger:
                 raise LedgerError("permission denied: not an authorised validator")
             if not self._pending:
                 raise LedgerError("no pending transactions to put in a block")
+            if type(max_txs) is not int or max_txs < 1:
+                raise LedgerError("max_txs must be a positive whole number")
             index = len(self._chain)
             timestamp = max(time.time(), self.last_block.timestamp)
 
             new_state = self._state.copy()
             included: List[Transaction] = []
-            for tx in self._pending[:max(1, min(max_txs, MAX_TXS_PER_BLOCK))]:
+            for tx in self._pending[:min(max_txs, MAX_TXS_PER_BLOCK)]:
                 try:
                     new_state.apply(tx, index, timestamp)
                     included.append(tx)
@@ -757,19 +821,27 @@ class CarbonLedger:
         if not chain:
             raise LedgerError("chain is empty")
         genesis = chain[0]
-        if genesis.index != 0 or genesis.previous_hash != ZERO_HASH:
+        now = time.time()
+        if type(genesis.index) is not int or genesis.index != 0 \
+                or not _valid_timestamp(genesis.timestamp) \
+                or genesis.timestamp > now + MAX_CLOCK_SKEW \
+                or genesis.previous_hash != ZERO_HASH:
             raise LedgerError("block 0: invalid genesis header")
         if len(genesis.transactions) != 1 or genesis.validator or genesis.signature:
             raise LedgerError("block 0: genesis must hold exactly one unsigned GENESIS transaction")
         if genesis.merkle_root != genesis.compute_merkle_root():
             raise LedgerError("block 0: Merkle root mismatch (genesis was altered)")
+        if genesis.transactions[0].timestamp != genesis.timestamp:
+            raise LedgerError("block 0: transaction and block timestamps must match")
         state = LedgerState()
         state.apply_genesis(genesis.transactions[0])
 
         for i in range(1, len(chain)):
             block, prev = chain[i], chain[i - 1]
-            if block.index != i:
+            if type(block.index) is not int or block.index != i:
                 raise LedgerError(f"block {i}: wrong index {block.index}")
+            if not _valid_timestamp(block.timestamp) or block.timestamp > now + MAX_CLOCK_SKEW:
+                raise LedgerError(f"block {i}: timestamp is invalid or too far in the future")
             if block.previous_hash != prev.hash:
                 raise LedgerError(f"block {i}: previous_hash does not match block {i - 1} "
                                   "(chain was altered)")
@@ -798,7 +870,7 @@ class CarbonLedger:
             try:
                 self._replay(self._chain)
                 return True, f"chain valid: {len(self._chain)} blocks verified"
-            except LedgerError as exc:
+            except (LedgerError, AttributeError, IndexError, TypeError, ValueError) as exc:
                 return False, str(exc)
 
     def is_valid(self) -> bool:
@@ -813,15 +885,34 @@ class CarbonLedger:
         report = []
         with self._lock:
             for i, block in enumerate(self._chain):
-                merkle_ok = block.merkle_root == block.compute_merkle_root()
+                try:
+                    block_hash = block.hash
+                except (AttributeError, TypeError, ValueError):
+                    block_hash = "<invalid>"
+                try:
+                    merkle_ok = block.merkle_root == block.compute_merkle_root()
+                except (AttributeError, TypeError, ValueError):
+                    merkle_ok = False
                 if i == 0:
-                    link_ok = block.previous_hash == ZERO_HASH
-                    sig_ok = True
+                    try:
+                        link_ok = block.previous_hash == ZERO_HASH
+                        tx = block.transactions[0] if len(block.transactions) == 1 else None
+                        sig_ok = (not block.validator and not block.signature and tx is not None
+                                  and not tx.sender and not tx.signature and not tx.approvals)
+                    except (AttributeError, TypeError):
+                        link_ok = False
+                        sig_ok = False
                 else:
-                    link_ok = block.previous_hash == self._chain[i - 1].hash
-                    sig_ok = (block.validator in self._state.validators
-                              and block.has_valid_signature())
-                report.append({"index": i, "hash": block.hash, "hash_link_ok": link_ok,
+                    try:
+                        link_ok = block.previous_hash == self._chain[i - 1].hash
+                    except (AttributeError, TypeError, ValueError):
+                        link_ok = False
+                    try:
+                        sig_ok = (block.validator in self._state.validators
+                                  and block.has_valid_signature())
+                    except (AttributeError, TypeError, ValueError):
+                        sig_ok = False
+                report.append({"index": i, "hash": block_hash, "hash_link_ok": link_ok,
                                "merkle_ok": merkle_ok, "signature_ok": sig_ok,
                                "ok": link_ok and merkle_ok and sig_ok})
         return report
@@ -850,27 +941,31 @@ class CarbonLedger:
     # -- queries ---------------------------------------------------------------------
 
     def get_credit(self, serial: str) -> Optional[Dict[str, Any]]:
-        credit = self._state.credits.get(serial)
-        return copy.deepcopy(credit) if credit else None
+        with self._lock:
+            credit = self._state.credits.get(serial)
+            return copy.deepcopy(credit) if credit else None
 
     def credit_history(self, serial: str) -> List[Dict[str, Any]]:
         """Every confirmed event in a credit's life, oldest first."""
-        credit = self._state.credits.get(serial)
-        return copy.deepcopy(credit["history"]) if credit else []
+        with self._lock:
+            credit = self._state.credits.get(serial)
+            return copy.deepcopy(credit["history"]) if credit else []
 
     def credits_owned(self, address: str, status: Optional[str] = ACTIVE,
                       project_id: Optional[str] = None) -> List[str]:
         """Serials held by an address (confirmed state), sorted."""
-        return sorted(s for s, c in self._state.credits.items()
-                      if c["owner"] == address
-                      and (status is None or c["status"] == status)
-                      and (project_id is None or c["project_id"] == project_id))
+        with self._lock:
+            return sorted(s for s, c in self._state.credits.items()
+                          if c["owner"] == address
+                          and (status is None or c["status"] == status)
+                          and (project_id is None or c["project_id"] == project_id))
 
     def balance(self, address: str) -> Dict[str, int]:
         counts = {ACTIVE: 0, RETIRED: 0, CANCELLED: 0}
-        for credit in self._state.credits.values():
-            if credit["owner"] == address:
-                counts[credit["status"]] += 1
+        with self._lock:
+            for credit in self._state.credits.values():
+                if credit["owner"] == address:
+                    counts[credit["status"]] += 1
         return counts
 
     def select_serials(self, address: str, quantity: int,
@@ -880,6 +975,8 @@ class CarbonLedger:
         (excluding ones already used by its pending transactions).
         Lets the interface say "transfer 40 credits" without listing serials.
         """
+        if type(quantity) is not int:
+            raise LedgerError("quantity must be a positive whole number")
         with self._lock:
             available = sorted(s for s, c in self._pending_state.credits.items()
                                if c["owner"] == address and c["status"] == ACTIVE
@@ -889,20 +986,27 @@ class CarbonLedger:
         return available[:quantity]
 
     def get_project(self, project_id: str) -> Optional[Dict[str, Any]]:
-        project = self._state.projects.get(project_id)
-        return copy.deepcopy(project) if project else None
+        with self._lock:
+            project = self._state.projects.get(project_id)
+            return copy.deepcopy(project) if project else None
 
     def list_projects(self) -> List[Dict[str, Any]]:
-        return [copy.deepcopy(p) for p in self._state.projects.values()]
+        with self._lock:
+            return [copy.deepcopy(p) for p in self._state.projects.values()]
 
     def list_issuers(self) -> List[Dict[str, Any]]:
-        return [copy.deepcopy(i) for i in self._state.issuers.values()]
+        with self._lock:
+            return [copy.deepcopy(i) for i in self._state.issuers.values()]
 
     def find_transaction(self, tx_id: str) -> Optional[Tuple[Block, Transaction]]:
-        for block in self._chain:
-            for tx in block.transactions:
-                if tx.tx_id == tx_id:
-                    return block, tx
+        with self._lock:
+            for block in self._chain:
+                for tx in block.transactions:
+                    if tx.tx_id == tx_id:
+                        block_copy = copy.deepcopy(block)
+                        copied_tx = next(item for item in block_copy.transactions
+                                         if item.tx_id == tx_id)
+                        return block_copy, copied_tx
         return None
 
     def inclusion_proof(self, tx_id: str) -> Optional[Dict[str, Any]]:
@@ -919,19 +1023,29 @@ class CarbonLedger:
 
     @staticmethod
     def verify_inclusion(proof: Dict[str, Any]) -> bool:
-        return verify_merkle_proof(proof["leaf_hash"], [tuple(p) for p in proof["proof"]],
-                                   proof["merkle_root"])
+        try:
+            if not isinstance(proof, dict) or not isinstance(proof["proof"], list):
+                return False
+            path = []
+            for item in proof["proof"]:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    return False
+                path.append((item[0], item[1]))
+            return verify_merkle_proof(proof["leaf_hash"], path, proof["merkle_root"])
+        except (KeyError, TypeError, ValueError):
+            return False
 
     def stats(self) -> Dict[str, Any]:
-        counts = {ACTIVE: 0, RETIRED: 0, CANCELLED: 0}
-        for credit in self._state.credits.values():
-            counts[credit["status"]] += 1
-        return {"blocks": len(self._chain), "pending": len(self._pending),
-                "projects": len(self._state.projects),
-                "registries": sum(1 for i in self._state.issuers.values() if i["active"]),
-                "credits_issued": len(self._state.credits),
-                "credits_active": counts[ACTIVE], "credits_retired": counts[RETIRED],
-                "credits_cancelled": counts[CANCELLED]}
+        with self._lock:
+            counts = {ACTIVE: 0, RETIRED: 0, CANCELLED: 0}
+            for credit in self._state.credits.values():
+                counts[credit["status"]] += 1
+            return {"blocks": len(self._chain), "pending": len(self._pending),
+                    "projects": len(self._state.projects),
+                    "registries": sum(1 for i in self._state.issuers.values() if i["active"]),
+                    "credits_issued": len(self._state.credits),
+                    "credits_active": counts[ACTIVE], "credits_retired": counts[RETIRED],
+                    "credits_cancelled": counts[CANCELLED]}
 
 
 # ==========================================================================
